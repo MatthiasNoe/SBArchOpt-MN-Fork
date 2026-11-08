@@ -49,7 +49,8 @@ def get_arch_sbo_rbf(init_size: int = 100, results_folder=None, **kwargs) -> Inf
 
 
 def get_arch_sbo_gp(problem: ArchOptProblemBase, init_size: int = 100, n_parallel=None, min_pof: float = None,
-                    kpls_n_dim: int = 10, g_aggregation: ConstraintAggregation = None, results_folder=None, **kwargs) \
+                    kpls_n_dim: int = 10, g_aggregation: ConstraintAggregation = None, results_folder=None,
+                    correction_adjusted: bool = False, **kwargs) \
         -> InfillAlgorithm:
     """
     Get an architecture SBO algorithm using a mixed-discrete Gaussian Process (Kriging) model as its surrogate model.
@@ -61,6 +62,8 @@ def get_arch_sbo_gp(problem: ArchOptProblemBase, init_size: int = 100, n_paralle
 
     To reduce model training times for high-dimensional problems, KPLS is used instead of Kriging when the problem
     dimension exceeds kpls_n_dim. Note that the DoE should then contain at least kpls_n_dim+1 points.
+
+    Set correction_adjusted to True to reduce the number of correction calls for single-objective categorical problems
     """
 
     # Create the mixed-discrete Kriging model, correctly configured for the given design space
@@ -69,23 +72,31 @@ def get_arch_sbo_gp(problem: ArchOptProblemBase, init_size: int = 100, n_paralle
 
     # Select the single- or multi-objective infill criterion, including constraint handling strategy
     infill, infill_batch = get_default_infill(
-        problem, n_parallel=n_parallel, min_pof=min_pof, g_aggregation=g_aggregation)
+        problem, n_parallel=n_parallel, min_pof=min_pof, g_aggregation=g_aggregation, correction_adjusted=correction_adjusted)
+        
 
     # Get default hidden constraint strategy
     hc_strategy = get_hc_strategy(kpls_n_dim=kpls_n_dim)
 
     return get_sbo(model, infill, infill_size=infill_batch, init_size=init_size, normalization=normalization,
-                   results_folder=results_folder, hc_strategy=hc_strategy, **kwargs)
+                   results_folder=results_folder, hc_strategy=hc_strategy,
+                   correction_adjusted=correction_adjusted, **kwargs)
 
 
 def get_sbo(surrogate_model, infill: 'SurrogateInfill', infill_size: int = 1, init_size: int = 100,
             infill_pop_size: int = 100, infill_gens: int = None, repair=None, normalization=None,
-            hc_strategy: 'HiddenConstraintStrategy' = None, results_folder=None, **kwargs) -> InfillAlgorithm:
+            hc_strategy: 'HiddenConstraintStrategy' = None, results_folder=None,
+            correction_adjusted: bool = False, **kwargs) -> InfillAlgorithm:
     """Create the SBO algorithm given some SMT surrogate model and an infill criterion"""
 
-    sbo = SBOInfill(surrogate_model, infill, pop_size=infill_pop_size, termination=infill_gens, repair=repair,
-                    normalization=normalization, hc_strategy=hc_strategy, verbose=True)\
-        .algorithm(infill_size=infill_size, init_size=init_size, **kwargs)
+    if not correction_adjusted:
+        sbo = SBOInfill(surrogate_model, infill, pop_size=infill_pop_size, termination=infill_gens, repair=repair,
+                        normalization=normalization, hc_strategy=hc_strategy, verbose=True,)\
+            .algorithm(infill_size=infill_size, init_size=init_size, **kwargs)
+    else:
+        sbo = Adjusted_SBOInfill(surrogate_model, infill, pop_size=infill_pop_size, termination=infill_gens, repair=repair,
+                        normalization=normalization, hc_strategy=hc_strategy, verbose=True,)\
+            .algorithm(infill_size=infill_size, init_size=init_size, **kwargs)
 
     if results_folder is not None:
         sbo.store_intermediate_results(results_folder=results_folder)

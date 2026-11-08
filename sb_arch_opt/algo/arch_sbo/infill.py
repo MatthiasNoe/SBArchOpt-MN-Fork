@@ -23,6 +23,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 import timeit
+from typing import Any, List
 import numpy as np
 from typing import *
 from enum import Enum
@@ -60,7 +61,8 @@ if HAS_SMT:
 
 
 def get_default_infill(problem: ArchOptProblemBase, n_parallel: int = None, min_pof: float = None,
-                       g_aggregation: 'ConstraintAggregation' = None) -> Tuple['ConstrainedInfill', int]:
+                       g_aggregation: 'ConstraintAggregation' = None, correction_adjusted: bool = False
+                       ) -> Tuple['ConstrainedInfill', int]:
     """
     Get the default infill criterion according to the following logic:
     - Single-objective: Ensemble of EI, LCB, PoI with n_batch = n_parallel
@@ -82,8 +84,10 @@ def get_default_infill(problem: ArchOptProblemBase, n_parallel: int = None, min_
 
     def _get_infill():
         # Single-objective ensemble infill
-        if problem.n_obj == 1:
+        if problem.n_obj == 1 and not correction_adjusted:
             return EnsembleInfill(so_ensemble), n_parallel
+        elif problem.n_obj == 1 and correction_adjusted:
+            return Adjusted_EnsembleInfill(so_ensemble), n_parallel
 
         # Multi-objective ensemble infill
         return EnsembleInfill(mo_ensemble), n_parallel
@@ -515,7 +519,7 @@ class ExpectedImprovementInfill(ConstrainedInfill):
     The Expected Improvement (EI) naturally balances exploitation and exploration by representing the expected amount
     of improvement at some point taking into accounts its probability of improvement.
 
-    EI(x) = (f_min-y(x)) * Phi((f_min - y(x))/s(x)) + s(x) * phi((f_min - y(x)) / s(x))
+    EI(x) = (f_min-y(x)) * Phi((f_min - y(x))/sqrt(s(x))) + s(x) * phi((f_min - y(x)) / sqrt(s(x)))
     where
     - f_min is the current best point (real)
     - y(x) the surrogate model estimate
@@ -849,6 +853,47 @@ class EnsembleInfill(ConstrainedInfill):
             i_keep[i_remove] = False
             opt_pop = opt_pop[i_keep]
         return opt_pop
+
+
+class Adjusted_EnsembleInfill(EnsembleInfill):
+    """
+    Adjusted EnsembleInfill strategy that discourages exploration near known invalid points.
+    Only works for single objective categorical problems!
+    """
+
+    def __init__(self, infills: List[ConstrainedInfill] = None, constraint_strategy: ConstraintStrategy = None, x_inval: Optional[np.ndarray] = None):
+        super().__init__(infills, constraint_strategy)
+
+        self.x_inval = x_inval
+
+    def _w(self, x: np.ndarray):
+        x_inval = self.x_inval
+        n = x.shape[1]
+        if x_inval is None or len(x_inval) == 0:
+            return np.ones(x.shape[0])
+        distances = np.count_nonzero(
+            x[:, None, :] != x_inval[None, :, :],
+            axis=2
+        )
+        a_min = distances.min(axis=1)
+        c = 10 # Weighting of the impact of nearby known invalid points on exploration
+        w = (1 - np.exp(-c * a_min / n))**2
+        return w
+
+    def _evaluate(self, x: np.ndarray, is_active: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        f, g = self.predict(x, is_active)
+        f_var, g_var = self.predict_variance(x, is_active)
+
+        # Apply constraint handling strategy
+        g_infill = g
+        if self.n_constr > 0:
+            g_infill = self.constraint_strategy.evaluate(x, g, g_var)
+
+        f_var = self._w(x)*f_var # Reduction of the variance if a design vector x_i is cloase to a known invalid design vector
+        # Merge underlying infill criteria
+        f_underlying = [infill.evaluate_f(f, f_var) for infill in self.infills]
+        f_infill = np.column_stack(f_underlying)
+        return f_infill, g_infill
 
 
 class IgnoreConstraints(ConstraintStrategy):

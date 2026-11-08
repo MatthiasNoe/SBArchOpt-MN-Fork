@@ -25,9 +25,15 @@ SOFTWARE.
 import copy
 import timeit
 import logging
+from typing import Any
 import numpy as np
 from typing import *
+
+from sb_arch_opt.algo.arch_sbo.hc_strategy import HiddenConstraintStrategy
+from sb_arch_opt.algo.arch_sbo.infill import SurrogateInfill
+from smt.surrogate_models.surrogate_model import SurrogateModel
 from sb_arch_opt.problem import *
+from sb_arch_opt.problem import ArchOptProblemBase
 from sb_arch_opt.sampling import *
 from scipy.spatial import distance
 from sb_arch_opt.algo.pymoo_interface import *
@@ -531,6 +537,147 @@ class SBOInfill(InfillCriterion):
         return self.repair
 
 
+class Adjusted_SBOInfill(SBOInfill):
+    '''
+    Adjusted SBOInfill that discourages exploration near known invalid points.
+    Only works for single objective categorical problems!
+    '''
+
+    def __init__(self, surrogate_model: SurrogateModel, infill: SurrogateInfill, pop_size=None,
+                 termination: Termination | int = None, normalization: Normalization = None, verbose=False,
+                 repair: Repair = None, eliminate_duplicates: DuplicateElimination = None, force_new_points: bool = True,
+                 hc_strategy: HiddenConstraintStrategy = None, seed: int = None, **kwargs):
+        super().__init__(surrogate_model, infill, pop_size, termination, normalization, verbose, repair,
+                         eliminate_duplicates, force_new_points, hc_strategy, seed, **kwargs)
+        
+        self.x_inval: Optional[np.ndarray] = None
+
+    def do(self, problem, pop, n_offsprings, **kwargs):
+        self._algorithm = kwargs.pop('algorithm', None)
+
+        # Check if we need to initialize
+        if self._is_init is None:
+            if not isinstance(problem, ArchOptProblemBase):
+                raise RuntimeError('ArchSBO requires an ArchOptProblem')
+            self.problem = problem
+            self._is_init = problem
+
+            self._initialize()
+
+        elif self._is_init is not problem:
+            raise RuntimeError('An instance of a ModelBasedInfillCriterion can only be used with one Problem!')
+
+        # (Re-)build the surrogate model
+        if self.total_pop is None:
+            self.total_pop = pop
+        else:
+            new_population = self.eliminate_duplicates.do(pop, self.total_pop)
+            self.total_pop = Population.merge(self.total_pop, new_population)
+
+        self._build_model()
+
+        # Search the surrogate model for infill points
+        s = timeit.default_timer()
+        off = self._generate_infill_points(n_offsprings)
+        self.time_infill = timeit.default_timer()-s
+
+        # Correction and saving of is_active vector and invalid infill points
+        # Method that returns a boolean vector which determines the rows of A that are in B
+        def isin_rows(A, B):
+            A_view = np.ascontiguousarray(A).view(
+                np.dtype((np.void, A.dtype.itemsize * A.shape[1]))
+            ).ravel()
+
+            B_view = np.ascontiguousarray(B).view(
+                np.dtype((np.void, B.dtype.itemsize * B.shape[1]))
+            ).ravel()
+            return np.isin(A_view, B_view)
+
+        x = off.get('X')
+        x_corr, is_active = self.problem.correct_x(off.get('X'))
+        off.set('X', x_corr)
+        off = self.eliminate_duplicates.do(off, pop)
+        x_inval = x[~isin_rows(x, x_corr)] # all invalid design vectors of x
+        if self.x_inval is not None:
+            # Save all new invalid vectors
+            self.x_inval = np.vstack((self.x_inval, x_inval[~isin_rows(x_inval, self.x_inval)]))
+        else:
+            self.x_inval = x_inval
+        # save all is_active vectors of the corrected unique design vectors
+        assert isinstance(self.eliminate_duplicates, LargeDuplicateElimination)
+        is_duplicate = self.eliminate_duplicates.eliminate(x_corr)
+        unique_indices = np.where(~is_duplicate)[0]
+        self.is_active_train = np.vstack((self.is_active_train, is_active[unique_indices]))
+
+        # Randomly select offspring if too many points were generated
+        if len(off) > n_offsprings:
+            i_select = np.random.choice(len(off), n_offsprings, replace=False)
+            off = off[i_select]
+
+        # Add random points if not enough points were generated
+        elif len(off) < n_offsprings:
+            off = Population.merge(off, self._get_random_infill_points(n_offsprings-len(off)))
+
+        if self.verbose:
+            n_eval_outer = self._algorithm.evaluator.n_eval if self._algorithm is not None else -1
+            log.info(f'Infill: {len(off)} new (eval {len(self.total_pop)} real unique, {n_eval_outer} eval)')
+
+        return off
+
+    def _build_model(self):
+        """Update the underlying model. New population is given, total population is available from self.total_pop"""
+        self.hc_strategy.initialize(self.problem)
+
+        # Get input and output training points
+        x = self.total_pop.get('X')
+        y = self.total_pop.get('F')
+        if self.problem.n_ieq_constr > 0:
+            y = np.column_stack([y, self.total_pop.get('G')])
+        x_in = x.copy()
+        y_in = y.copy()
+
+        # Select training values
+        x, y = self._get_xy_train(x, y)
+
+        # Normalize training output
+        n_obj = self.problem.n_obj
+        f_norm, self.y_train_min, self.y_train_max = self._normalize_y(y[:, :n_obj])
+        self.y_train_centered = [False]*f_norm.shape[1]
+        y_norm = f_norm
+
+        if self.problem.n_ieq_constr > 0:
+            g_norm, g_min, g_max = self._get_normalize_g(y[:, n_obj:])
+            y_norm = np.column_stack([y_norm, g_norm])
+
+            self.y_train_min = np.append(self.y_train_min, g_min)
+            self.y_train_max = np.append(self.y_train_max, g_max)
+            self.y_train_centered += [True]*g_norm.shape[1]
+
+        # Train the model
+        # is_active vectors are calculated and saved in do() instead
+        self.x_train = x
+        self.y_train = y_norm
+
+        self.pf_estimate = None
+        self._train_model()
+
+        self.hc_strategy.prepare_infill_search(x_in, y_in)
+
+    def _get_infill_problem(self, infill: SurrogateInfill = None, force_new_points=None):
+        if infill is None:
+            infill = self.infill
+        if force_new_points is None:
+            force_new_points = self.force_new_points
+
+        # Apply hidden constraints strategy
+        hc_infill = HCInfill(infill, self.hc_strategy)
+
+        x_exist = self.total_pop.get('X') if force_new_points else None
+        infill_problem = Adjusted_SurrogateInfillOptimizationProblem(hc_infill, self.problem, self.x_inval, x_exist=x_exist)
+
+        return infill_problem, hc_infill
+
+
 class SurrogateInfillCallback(Callback):
     """Callback for printing infill optimization progress."""
 
@@ -597,3 +744,40 @@ class SurrogateInfillOptimizationProblem(ArchOptProblemBase):
 
     def __repr__(self):
         return f'{self.__class__.__name__}({self.infill!r}, {self._problem!r})'
+
+
+class Adjusted_SurrogateInfillOptimizationProblem(SurrogateInfillOptimizationProblem):
+    '''
+    Adjusted SurrogateInfillOptimizationProblem that discourages exploration near known invalid points.
+    Only works for single objective categorical problems!
+    '''
+
+    def __init__(self, infill: SurrogateInfill, problem: ArchOptProblemBase, x_inval: np.ndarray, x_exist: np.ndarray[tuple[Any, ...], np.dtype[Any]] = None):
+        super().__init__(infill, problem, x_exist)
+
+    def _arch_evaluate(self, x: np.ndarray, is_active_out: np.ndarray, f_out: np.ndarray, g_out: np.ndarray,
+                       h_out: np.ndarray, *args, **kwargs):
+        if not self.design_space.is_explicit():
+            self._correct_x_impute(x, is_active_out)
+
+        # Get infill search objectives and constraints
+        f, g = self.infill.evaluate(x, is_active_out)
+
+        if f.shape != (x.shape[0], self.n_obj):
+            raise RuntimeError(f'Wrong objective results shape: {f.shape!r} != {(x.shape[0], self.n_obj)!r}')
+        f_out[:, :] = f
+
+        if g is None and self.n_constr > 0:
+            g = np.zeros((x.shape[0], 0))
+
+        # Add additional constraint to force the selection of new (discrete) points
+        if self.force_new_points:
+            g_force_new = np.zeros((x.shape[0],))
+            _, _, is_dup = self.eliminate_duplicates.do(Population.new(X=x), self.pop_exist, return_indices=True)
+            g_force_new[is_dup] = 1.
+
+            g = np.column_stack([g, g_force_new])
+
+        if g.shape != (x.shape[0], self.n_constr):
+            raise RuntimeError(f'Wrong constraint results shape: {g.shape!r} != {(x.shape[0], self.n_constr)!r}')
+        g_out[:, :] = g
